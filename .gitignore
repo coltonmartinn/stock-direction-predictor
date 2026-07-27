@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+watchlist.json
+*_dashboard.png
+prediction_dashboard.png
+*.log
