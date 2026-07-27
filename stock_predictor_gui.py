@@ -127,6 +127,7 @@ class StockPredictorApp(tk.Tk):
 
         self.tickers = load_watchlist()   # source of truth; the Listbox is just its display
         self.horizon_var = tk.StringVar(value=next(iter(HORIZONS)))  # "Tomorrow"
+        self.chart_view_var = tk.StringVar(value="Feature Importance")
 
         self._build_styles()
         self._build_layout()
@@ -337,6 +338,15 @@ class StockPredictorApp(tk.Tk):
         self.verdict_tile = self._make_stat_tile(stats_row, "⚖️ vs. Guessing the Majority")
         self.verdict_tile["frame"].pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(6, 0))
 
+        # --- Right-hand chart toggle ---
+        chart_toggle_row = ttk.Frame(right, style="TFrame")
+        chart_toggle_row.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(chart_toggle_row, text="Right chart:", font=("Segoe UI", 9)).pack(side=tk.LEFT, padx=(0, 8))
+        for label in ("Feature Importance", "Confidence Calibration"):
+            ttk.Radiobutton(chart_toggle_row, text=label, value=label, variable=self.chart_view_var,
+                             style="Horizon.Toolbutton", cursor="hand2",
+                             command=self._on_chart_view_change).pack(side=tk.LEFT, padx=(0, 6))
+
         # --- Charts card ---
         charts_card = tk.Frame(right, bg=COLORS["card_bg"],
                                 highlightbackground=COLORS["border"], highlightthickness=1)
@@ -371,7 +381,9 @@ class StockPredictorApp(tk.Tk):
         return {"frame": frame, "value_var": value_var, "value_lbl": value_lbl}
 
     def _style_empty_axes(self):
-        for ax, title in ((self.ax_price, "Price Trend"), (self.ax_importance, "What Influenced This Prediction")):
+        importance_title = "What Influenced This Prediction" if self.chart_view_var.get() == "Feature Importance" \
+            else "Confidence Calibration"
+        for ax, title in ((self.ax_price, "Price Trend"), (self.ax_importance, importance_title)):
             ax.clear()
             ax.set_facecolor(COLORS["card_bg"])
             ax.set_title(title, fontsize=10, fontweight="bold", color=COLORS["text_primary"])
@@ -462,6 +474,9 @@ class StockPredictorApp(tk.Tk):
 
     def _on_horizon_change(self):
         self._refresh_watchlist_display()
+        self._on_watchlist_select()
+
+    def _on_chart_view_change(self):
         self._on_watchlist_select()
 
     # ------------------------------------------------------------------
@@ -660,6 +675,14 @@ class StockPredictorApp(tk.Tk):
             self.ax_price.spines[spine].set_color(COLORS["axis"])
 
         horizon_data = self._horizon_data()
+        if self.chart_view_var.get() == "Feature Importance":
+            self._draw_importance_chart(horizon_data)
+        else:
+            self._draw_calibration_chart(horizon_data)
+
+        self.canvas.draw()
+
+    def _draw_importance_chart(self, horizon_data):
         importances = horizon_data["feature_importances"] if horizon_data and "error" not in horizon_data else {}
         order = sorted(range(len(FEATURE_COLUMNS)), key=lambda i: importances.get(FEATURE_COLUMNS[i], 0))
         names = [FEATURE_DISPLAY_NAMES[FEATURE_COLUMNS[i]] for i in order]
@@ -703,7 +726,50 @@ class StockPredictorApp(tk.Tk):
         for spine in ("left", "bottom"):
             self.ax_importance.spines[spine].set_color(COLORS["axis"])
 
-        self.canvas.draw()
+    def _draw_calibration_chart(self, horizon_data):
+        """Reliability diagram: when the model says it's X% confident, is it
+        actually right about X% of the time? Points above the dashed diagonal
+        mean the model is under-confident there; below means over-confident."""
+        calibration = horizon_data.get("calibration") if horizon_data and "error" not in horizon_data else None
+        bin_pred = calibration["bin_pred"] if calibration else []
+        bin_true = calibration["bin_true"] if calibration else []
+
+        if bin_pred:
+            self.ax_importance.plot([0.4, 1], [0.4, 1], linestyle="--", linewidth=1.2,
+                                     color=COLORS["axis"], label="Perfect calibration")
+            self.ax_importance.plot(bin_pred, bin_true, marker="o", markersize=6, linewidth=2,
+                                     color=COLORS["accent"], label="Model")
+            self.ax_importance.set_xlim(0.4, 1.0)
+            self.ax_importance.set_ylim(0.0, 1.0)
+            self.ax_importance.xaxis.set_major_formatter(FuncFormatter(lambda x, _pos: f"{x:.0%}"))
+            self.ax_importance.yaxis.set_major_formatter(FuncFormatter(lambda x, _pos: f"{x:.0%}"))
+            self.ax_importance.set_xlabel("Predicted Confidence", fontsize=7.5, color=COLORS["text_secondary"])
+            self.ax_importance.set_ylabel("Actually Correct", fontsize=7.5, color=COLORS["text_secondary"])
+            legend = self.ax_importance.legend(loc="upper left", fontsize=7.5, frameon=False)
+            for text in legend.get_texts():
+                text.set_color(COLORS["text_secondary"])
+            self.ax_importance.text(
+                0.98, 0.04, "Above line = under-confident\nBelow line = over-confident",
+                fontsize=7, color=COLORS["text_muted"], ha="right", va="bottom",
+                transform=self.ax_importance.transAxes,
+            )
+            self.ax_importance.set_title(
+                f"Confidence Calibration — Shared Model\nBrier score {calibration['brier_score']:.3f} "
+                f"(lower is better) · n={calibration['n_test']:,}",
+                fontsize=9, fontweight="bold", color=COLORS["text_primary"], wrap=True)
+        else:
+            self.ax_importance.set_title("Confidence Calibration", fontsize=9.5,
+                                          fontweight="bold", color=COLORS["text_primary"])
+            self.ax_importance.text(0.5, 0.5, "Not enough test data yet", ha="center", va="center",
+                                     fontsize=9, color=COLORS["text_muted"],
+                                     transform=self.ax_importance.transAxes)
+
+        self.ax_importance.tick_params(axis="both", colors=COLORS["text_muted"])
+        self.ax_importance.grid(True, color=COLORS["grid"], linewidth=0.8)
+        for spine in ("top", "right"):
+            self.ax_importance.spines[spine].set_visible(False)
+        for spine in ("left", "bottom"):
+            self.ax_importance.spines[spine].set_color(COLORS["axis"])
 
     def _save_chart(self):
         ticker = self._selected_ticker()

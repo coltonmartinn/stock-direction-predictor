@@ -39,9 +39,10 @@ warnings.filterwarnings("ignore")
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from sklearn.calibration import calibration_curve
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.inspection import permutation_importance
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import accuracy_score, brier_score_loss
 
 # --------------------------------------------------------------------------
 # CONFIG
@@ -259,6 +260,40 @@ def make_classifier() -> HistGradientBoostingClassifier:
     )
 
 
+def _calibration_check(classifier, features_test: pd.DataFrame, labels_test: pd.Series, predicted_labels) -> dict:
+    """Check whether the model's confidence is trustworthy: when it says
+    it's 70% confident, is it actually right about 70% of the time?
+
+    Confidence here means P(the class the model actually called) — i.e.
+    whichever is bigger, P(up) or P(down), matching what the app displays
+    as "confidence in this call". Bucketed into equal-sized quantile bins
+    (since confidence tends to cluster in a narrow band, e.g. 50-65%, for
+    this kind of weak-signal problem — fixed-width bins would leave most
+    of them empty) and compared against the bucket's actual accuracy.
+
+    Brier score is a single-number summary of the same idea: mean squared
+    error between predicted P(up) and the actual 0/1 outcome — 0 is
+    perfect, 0.25 is what a constant 50% guess scores, higher is worse.
+    """
+    proba_up = classifier.predict_proba(features_test)[:, 1]
+    confidence = np.maximum(proba_up, 1 - proba_up)
+    correct = (np.asarray(predicted_labels) == labels_test.to_numpy()).astype(int)
+    brier = brier_score_loss(labels_test, proba_up)
+
+    n_bins = 8
+    try:
+        bin_true, bin_pred = calibration_curve(correct, confidence, n_bins=n_bins, strategy="quantile")
+    except ValueError:
+        bin_true, bin_pred = np.array([]), np.array([])
+
+    return {
+        "bin_pred": bin_pred.tolist(),
+        "bin_true": bin_true.tolist(),
+        "brier_score": float(brier),
+        "n_test": int(len(labels_test)),
+    }
+
+
 def _train_one_horizon(featured_by_ticker: dict, horizon_days: int, base_skipped: list) -> dict:
     """Label + split + pool + train + evaluate for a single horizon, reusing
     already-fetched/feature-engineered data for every ticker."""
@@ -317,6 +352,8 @@ def _train_one_horizon(featured_by_ticker: dict, horizon_days: int, base_skipped
     )
     feature_importances = dict(zip(FEATURE_COLUMNS, importance.importances_mean))
 
+    calibration = _calibration_check(classifier, pooled_features_test, pooled_labels_test, overall_predicted)
+
     results = {}
     for ticker, data in per_ticker.items():
         labels_test = data["labels_test"]
@@ -343,6 +380,7 @@ def _train_one_horizon(featured_by_ticker: dict, horizon_days: int, base_skipped
         "overall_accuracy": overall_accuracy,
         "overall_baseline_accuracy": overall_baseline_accuracy,
         "feature_importances": feature_importances,
+        "calibration": calibration,
         "per_ticker": results,
         "skipped": skipped,
     }
