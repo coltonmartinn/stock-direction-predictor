@@ -25,7 +25,7 @@ IMPORTANT / DISCLAIMER
 
 Requirements
 ------------
-pip install yfinance scikit-learn pandas numpy matplotlib
+pip install yfinance scikit-learn pandas numpy matplotlib lxml
 
 Usage
 -----
@@ -43,6 +43,7 @@ from sklearn.calibration import calibration_curve
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.inspection import permutation_importance
 from sklearn.metrics import accuracy_score, brier_score_loss
+from sklearn.model_selection import TimeSeriesSplit
 
 # --------------------------------------------------------------------------
 # CONFIG
@@ -73,6 +74,48 @@ HORIZONS = {
     "1 Month": 21,
 }
 
+# Known ticker -> sector-ETF mapping, so common tickers don't need an extra
+# network lookup to find their sector. Anything not listed here falls back to
+# a live lookup (see get_sector_etf()).
+TICKER_SECTOR_ETF = {
+    "AAPL": "XLK", "MSFT": "XLK", "NVDA": "XLK", "ADBE": "XLK", "CRM": "XLK",
+    "INTC": "XLK", "CSCO": "XLK",
+    "GOOGL": "XLC", "META": "XLC", "NFLX": "XLC", "DIS": "XLC", "VZ": "XLC", "T": "XLC",
+    "AMZN": "XLY", "HD": "XLY", "TSLA": "XLY",
+    "JPM": "XLF", "BAC": "XLF", "WFC": "XLF", "V": "XLF", "MA": "XLF",
+    "JNJ": "XLV", "PFE": "XLV", "UNH": "XLV",
+    "XOM": "XLE", "CVX": "XLE",
+    "PG": "XLP", "KO": "XLP", "PEP": "XLP", "WMT": "XLP",
+}
+
+# GICS sector name (as reported by yfinance's .info) -> sector ETF, for tickers
+# not in TICKER_SECTOR_ETF above (e.g. custom watchlist additions).
+SECTOR_NAME_TO_ETF = {
+    "Technology": "XLK",
+    "Financial Services": "XLF", "Financials": "XLF",
+    "Healthcare": "XLV", "Health Care": "XLV",
+    "Energy": "XLE",
+    "Consumer Defensive": "XLP", "Consumer Staples": "XLP",
+    "Consumer Cyclical": "XLY", "Consumer Discretionary": "XLY",
+    "Communication Services": "XLC",
+    "Industrials": "XLI",
+    "Basic Materials": "XLB", "Materials": "XLB",
+    "Utilities": "XLU",
+    "Real Estate": "XLRE",
+}
+
+# Walk-forward hyperparameter search: candidates tried per horizon, evaluated
+# across CV_FOLDS chronological folds, cheapest/most-regularized listed second
+# so it's the fallback if there isn't enough data to run the search at all.
+CV_FOLDS = 3
+HYPERPARAM_GRID = [
+    {"max_depth": 3, "learning_rate": 0.05, "min_samples_leaf": 20, "l2_regularization": 0.1},
+    {"max_depth": 4, "learning_rate": 0.05, "min_samples_leaf": 20, "l2_regularization": 0.1},
+    {"max_depth": 4, "learning_rate": 0.03, "min_samples_leaf": 30, "l2_regularization": 0.3},
+    {"max_depth": 5, "learning_rate": 0.05, "min_samples_leaf": 40, "l2_regularization": 0.3},
+    {"max_depth": 3, "learning_rate": 0.1, "min_samples_leaf": 15, "l2_regularization": 0.05},
+]
+
 
 # --------------------------------------------------------------------------
 # 1. DATA FETCHING
@@ -89,17 +132,46 @@ def fetch_price_history(ticker: str, period: str = LOOKBACK_PERIOD) -> pd.DataFr
     return df
 
 
-def fetch_market_context(period: str = LOOKBACK_PERIOD) -> pd.DataFrame:
-    """Download the broad-market benchmark used to compute how much of a
-    stock's daily move is market-wide noise vs. stock-specific signal."""
-    market_raw = fetch_price_history(MARKET_TICKER, period=period)
-    market_close = market_raw["Close"]
-    market = pd.DataFrame(index=market_raw.index)
-    market["Market_Return_1d"] = market_close.pct_change()
-    market["Market_Return_5d"] = market_close.pct_change(5)
-    market_sma20 = market_close.rolling(20).mean()
-    market["Market_Price_vs_SMA20"] = (market_close - market_sma20) / market_sma20
-    return market
+def fetch_benchmark_context(benchmark_ticker: str, period: str = LOOKBACK_PERIOD) -> pd.DataFrame:
+    """Download a benchmark's own return/trend series, used to compute how
+    much of a stock's move is the benchmark moving vs. the stock itself.
+    Used for both the broad market (SPY) and per-sector ETFs."""
+    raw = fetch_price_history(benchmark_ticker, period=period)
+    close = raw["Close"]
+    context = pd.DataFrame(index=raw.index)
+    context["Return_1d"] = close.pct_change()
+    context["Return_5d"] = close.pct_change(5)
+    sma20 = close.rolling(20).mean()
+    context["Price_vs_SMA20"] = (close - sma20) / sma20
+    return context
+
+
+def get_sector_etf(ticker: str) -> str:
+    """Best-effort sector ETF for a ticker: check the known table first, else
+    ask yfinance for its GICS sector and map that to an ETF. Returns None if
+    both fail (sector-relative features just fall back to neutral)."""
+    if ticker in TICKER_SECTOR_ETF:
+        return TICKER_SECTOR_ETF[ticker]
+    try:
+        import yfinance as yf
+        sector_name = yf.Ticker(ticker).info.get("sector")
+        return SECTOR_NAME_TO_ETF.get(sector_name)
+    except Exception:
+        return None
+
+
+def fetch_earnings_dates(ticker: str) -> pd.DatetimeIndex:
+    """Best-effort fetch of known earnings report dates (past + upcoming) for
+    a ticker. Returns an empty index on any failure — the earnings-proximity
+    feature just falls back to a neutral "unknown" value in that case."""
+    try:
+        import yfinance as yf
+        df = yf.Ticker(ticker).get_earnings_dates(limit=60)
+        if df is None or df.empty:
+            return pd.DatetimeIndex([])
+        return pd.DatetimeIndex(df.index).tz_localize(None)
+    except Exception:
+        return pd.DatetimeIndex([])
 
 
 # --------------------------------------------------------------------------
@@ -116,11 +188,36 @@ def compute_rsi(series: pd.Series, window: int = 14) -> pd.Series:
     return rsi.fillna(50)
 
 
-def add_features(df: pd.DataFrame, market: pd.DataFrame = None) -> pd.DataFrame:
-    """Build technical-indicator + market-relative features from raw OHLCV data.
+def _earnings_proximity_days(index: pd.DatetimeIndex, earnings_dates: pd.DatetimeIndex,
+                              cap_days: int = 90) -> pd.Series:
+    """Calendar days to the NEAREST earnings report (past or future) for each
+    row — small values mean "an earnings report just happened or is about to",
+    which is when moves disproportionately cluster. Capped so a missing/distant
+    earnings date reads as a flat "neutral, nothing nearby" rather than an
+    extreme outlier."""
+    if earnings_dates is None or len(earnings_dates) == 0:
+        return pd.Series(float(cap_days), index=index)
 
-    `market` is the output of fetch_market_context() — pass the SAME one in
-    for every ticker in a batch so it's only downloaded once.
+    earnings_sorted = np.sort(earnings_dates.values)
+    idx_values = index.values
+    pos = np.searchsorted(earnings_sorted, idx_values)
+    pos_right = np.clip(pos, 0, len(earnings_sorted) - 1)
+    pos_left = np.clip(pos - 1, 0, len(earnings_sorted) - 1)
+    right_gap = np.abs((earnings_sorted[pos_right] - idx_values) / np.timedelta64(1, "D"))
+    left_gap = np.abs((earnings_sorted[pos_left] - idx_values) / np.timedelta64(1, "D"))
+    proximity = np.minimum(right_gap, left_gap)
+    return pd.Series(np.clip(proximity, 0, cap_days), index=index)
+
+
+def add_features(df: pd.DataFrame, market: pd.DataFrame = None, sector: pd.DataFrame = None,
+                  earnings_dates: pd.DatetimeIndex = None) -> pd.DataFrame:
+    """Build technical-indicator + market/sector-relative + earnings-proximity
+    features from raw OHLCV data.
+
+    `market` and `sector` are outputs of fetch_benchmark_context() (for SPY
+    and the ticker's sector ETF respectively) — pass the SAME market context
+    in for every ticker in a batch so it's only downloaded once; sector
+    context should be shared across tickers in the same sector.
     """
     out = df.copy()
     close = out["Close"]
@@ -158,13 +255,26 @@ def add_features(df: pd.DataFrame, market: pd.DataFrame = None) -> pd.DataFrame:
     # vs. the whole market moving the same way that day.
     if market is not None:
         aligned_market = market.reindex(out.index).ffill()
-        out["Relative_Return_1d"] = out["Return_1d"] - aligned_market["Market_Return_1d"]
-        out["Relative_Return_5d"] = out["Return_5d"] - aligned_market["Market_Return_5d"]
-        out["Relative_Strength"] = out["Price_vs_SMA20"] - aligned_market["Market_Price_vs_SMA20"]
+        out["Relative_Return_1d"] = out["Return_1d"] - aligned_market["Return_1d"]
+        out["Relative_Return_5d"] = out["Return_5d"] - aligned_market["Return_5d"]
+        out["Relative_Strength"] = out["Price_vs_SMA20"] - aligned_market["Price_vs_SMA20"]
     else:
         out["Relative_Return_1d"] = 0.0
         out["Relative_Return_5d"] = 0.0
         out["Relative_Strength"] = 0.0
+
+    # Sector-relative features: same idea, but against the stock's own sector
+    # ETF — a sharper "relative strength" signal than the broad market alone,
+    # since it isolates sector-wide moves too, not just market-wide ones.
+    if sector is not None:
+        aligned_sector = sector.reindex(out.index).ffill()
+        out["Sector_Relative_Return_1d"] = out["Return_1d"] - aligned_sector["Return_1d"]
+        out["Sector_Relative_Strength"] = out["Price_vs_SMA20"] - aligned_sector["Price_vs_SMA20"]
+    else:
+        out["Sector_Relative_Return_1d"] = 0.0
+        out["Sector_Relative_Strength"] = 0.0
+
+    out["Earnings_Proximity_Days"] = _earnings_proximity_days(out.index, earnings_dates)
 
     return out
 
@@ -202,6 +312,8 @@ FEATURE_COLUMNS = [
     "Volume_change", "Volume_avg_ratio",
     "Daily_range_pct",
     "Relative_Return_1d", "Relative_Return_5d", "Relative_Strength",
+    "Sector_Relative_Return_1d", "Sector_Relative_Strength",
+    "Earnings_Proximity_Days",
 ]
 
 # Human-readable labels for FEATURE_COLUMNS, used anywhere these are shown to a user.
@@ -222,6 +334,9 @@ FEATURE_DISPLAY_NAMES = {
     "Relative_Return_1d": "1-Day Move vs. Market",
     "Relative_Return_5d": "5-Day Move vs. Market",
     "Relative_Strength": "Trend Strength vs. Market",
+    "Sector_Relative_Return_1d": "1-Day Move vs. Sector",
+    "Sector_Relative_Strength": "Trend Strength vs. Sector",
+    "Earnings_Proximity_Days": "Days to Nearest Earnings Report",
 }
 
 
@@ -249,8 +364,8 @@ def prepare_dataset(featured_df: pd.DataFrame):
 # --------------------------------------------------------------------------
 # 4. MODEL TRAINING (pooled across tickers) / EVALUATION
 # --------------------------------------------------------------------------
-def make_classifier() -> HistGradientBoostingClassifier:
-    return HistGradientBoostingClassifier(
+def make_classifier(**overrides) -> HistGradientBoostingClassifier:
+    params = dict(
         max_depth=4,
         max_iter=300,
         learning_rate=0.05,
@@ -258,6 +373,22 @@ def make_classifier() -> HistGradientBoostingClassifier:
         l2_regularization=0.1,
         random_state=RANDOM_STATE,
     )
+    params.update(overrides)
+    return HistGradientBoostingClassifier(**params)
+
+
+def _walk_forward_folds(features_train: pd.DataFrame, labels_train: pd.Series, n_folds: int):
+    """Yield n_folds chronological (fold_features_train, fold_labels_train,
+    fold_features_test, fold_labels_test) tuples for one ticker's training
+    portion — walk-forward, so each fold's "test" is always chronologically
+    after its own "train". Yields nothing if there isn't enough data for
+    n_folds folds (TimeSeriesSplit needs at least n_folds + 1 samples)."""
+    min_rows = (n_folds + 1) * 10
+    if len(features_train) < min_rows:
+        return
+    for train_idx, test_idx in TimeSeriesSplit(n_splits=n_folds).split(features_train):
+        yield (features_train.iloc[train_idx], labels_train.iloc[train_idx],
+               features_train.iloc[test_idx], labels_train.iloc[test_idx])
 
 
 def _calibration_check(classifier, features_test: pd.DataFrame, labels_test: pd.Series, predicted_labels) -> dict:
@@ -296,10 +427,22 @@ def _calibration_check(classifier, features_test: pd.DataFrame, labels_test: pd.
 
 def _train_one_horizon(featured_by_ticker: dict, horizon_days: int, base_skipped: list) -> dict:
     """Label + split + pool + train + evaluate for a single horizon, reusing
-    already-fetched/feature-engineered data for every ticker."""
+    already-fetched/feature-engineered data for every ticker.
+
+    Also runs a walk-forward hyperparameter search (chronological CV folds,
+    pooled across tickers per fold) instead of using fixed hand-picked
+    settings, and prunes any feature whose permutation importance comes back
+    at or below zero on a held-out fold before the final fit — both decided
+    without ever touching the final test set, so the reported accuracy stays
+    a genuine, untouched holdout number.
+    """
     per_ticker = {}
     train_features_parts, train_labels_parts = [], []
     test_features_parts, test_labels_parts = [], []
+    fold_train_features = [[] for _ in range(CV_FOLDS)]
+    fold_train_labels = [[] for _ in range(CV_FOLDS)]
+    fold_test_features = [[] for _ in range(CV_FOLDS)]
+    fold_test_labels = [[] for _ in range(CV_FOLDS)]
     skipped = list(base_skipped)
 
     for ticker, featured in featured_by_ticker.items():
@@ -323,6 +466,12 @@ def _train_one_horizon(featured_by_ticker: dict, horizon_days: int, base_skipped
         test_features_parts.append(features_test)
         test_labels_parts.append(labels_test)
 
+        for k, (ftr, ltr, fte, lte) in enumerate(_walk_forward_folds(features_train, labels_train, CV_FOLDS)):
+            fold_train_features[k].append(ftr)
+            fold_train_labels[k].append(ltr)
+            fold_test_features[k].append(fte)
+            fold_test_labels[k].append(lte)
+
         per_ticker[ticker] = {
             "featured": labeled,
             "features_test": features_test,
@@ -339,7 +488,46 @@ def _train_one_horizon(featured_by_ticker: dict, horizon_days: int, base_skipped
     pooled_features_test = pd.concat(test_features_parts, ignore_index=True)
     pooled_labels_test = pd.concat(test_labels_parts, ignore_index=True)
 
-    classifier = make_classifier()
+    pooled_folds = [
+        (pd.concat(fold_train_features[k], ignore_index=True), pd.concat(fold_train_labels[k], ignore_index=True),
+         pd.concat(fold_test_features[k], ignore_index=True), pd.concat(fold_test_labels[k], ignore_index=True))
+        for k in range(CV_FOLDS)
+        if fold_train_features[k] and fold_test_features[k]
+    ]
+
+    # --- Walk-forward hyperparameter search (never touches the final test set) ---
+    best_params, best_cv_score = None, None
+    if pooled_folds:
+        for candidate in HYPERPARAM_GRID:
+            scores = []
+            for ftr, ltr, fte, lte in pooled_folds:
+                model = make_classifier(**candidate)
+                model.fit(ftr, ltr)
+                scores.append(accuracy_score(lte, model.predict(fte)))
+            mean_score = sum(scores) / len(scores)
+            if best_cv_score is None or mean_score > best_cv_score:
+                best_cv_score, best_params = mean_score, candidate
+    if best_params is None:
+        best_params = HYPERPARAM_GRID[1]  # matches the old fixed hand-picked defaults
+
+    # --- Feature pruning: screen on the LAST fold only, never on the final test set ---
+    active_features = list(FEATURE_COLUMNS)
+    if pooled_folds:
+        screen_ftr, screen_ltr, screen_fte, screen_lte = pooled_folds[-1]
+        screen_model = make_classifier(**best_params)
+        screen_model.fit(screen_ftr, screen_ltr)
+        screen_importance = permutation_importance(
+            screen_model, screen_fte, screen_lte, n_repeats=5, random_state=RANDOM_STATE,
+        )
+        screen_scores = dict(zip(FEATURE_COLUMNS, screen_importance.importances_mean))
+        survivors = [c for c in FEATURE_COLUMNS if screen_scores.get(c, 0) > 0]
+        if len(survivors) >= 3:
+            active_features = survivors
+
+    pooled_features_train = pooled_features_train[active_features]
+    pooled_features_test = pooled_features_test[active_features]
+
+    classifier = make_classifier(**best_params)
     classifier.fit(pooled_features_train, pooled_labels_train)
 
     overall_predicted = classifier.predict(pooled_features_test)
@@ -350,18 +538,20 @@ def _train_one_horizon(featured_by_ticker: dict, horizon_days: int, base_skipped
         classifier, pooled_features_test, pooled_labels_test,
         n_repeats=10, random_state=RANDOM_STATE,
     )
-    feature_importances = dict(zip(FEATURE_COLUMNS, importance.importances_mean))
+    feature_importances = dict(zip(active_features, importance.importances_mean))
 
     calibration = _calibration_check(classifier, pooled_features_test, pooled_labels_test, overall_predicted)
 
     results = {}
     for ticker, data in per_ticker.items():
         labels_test = data["labels_test"]
-        predicted_labels = classifier.predict(data["features_test"])
+        features_test = data["features_test"][active_features]
+        features_today = data["features_today"][active_features]
+        predicted_labels = classifier.predict(features_test)
         accuracy = accuracy_score(labels_test, predicted_labels)
         baseline_accuracy = max(labels_test.mean(), 1 - labels_test.mean())
 
-        proba = classifier.predict_proba(data["features_today"])[0]  # [P(down), P(up)]
+        proba = classifier.predict_proba(features_today)[0]  # [P(down), P(up)]
         prob_up = proba[1]
 
         results[ticker] = {
@@ -380,6 +570,9 @@ def _train_one_horizon(featured_by_ticker: dict, horizon_days: int, base_skipped
         "overall_accuracy": overall_accuracy,
         "overall_baseline_accuracy": overall_baseline_accuracy,
         "feature_importances": feature_importances,
+        "active_features": active_features,
+        "best_params": best_params,
+        "cv_score": best_cv_score,
         "calibration": calibration,
         "per_ticker": results,
         "skipped": skipped,
@@ -394,14 +587,29 @@ def train_multi_horizon_model(tickers: list, horizons: dict = HORIZONS) -> dict:
     Returns {horizon_label: {classifier, overall_accuracy, overall_baseline_accuracy,
     feature_importances, per_ticker, skipped}} — see _train_one_horizon().
     """
-    market = fetch_market_context()
+    market = fetch_benchmark_context(MARKET_TICKER)
+    sector_context_cache = {}  # sector ETF ticker -> its context (or None on failure), fetched once per sector
 
     featured_by_ticker = {}
     base_skipped = []
     for ticker in tickers:
         try:
             raw = fetch_price_history(ticker)
-            featured_by_ticker[ticker] = add_features(raw, market)
+
+            sector_etf = get_sector_etf(ticker)
+            sector = None
+            if sector_etf:
+                if sector_etf not in sector_context_cache:
+                    try:
+                        sector_context_cache[sector_etf] = fetch_benchmark_context(sector_etf)
+                    except Exception:
+                        sector_context_cache[sector_etf] = None
+                sector = sector_context_cache[sector_etf]
+
+            earnings_dates = fetch_earnings_dates(ticker)
+
+            featured_by_ticker[ticker] = add_features(raw, market=market, sector=sector,
+                                                        earnings_dates=earnings_dates)
         except Exception as e:
             base_skipped.append((ticker, str(e)))
 

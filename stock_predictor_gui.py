@@ -22,7 +22,7 @@ stock_predictor.py's module docstring for the full disclaimer.
 
 Requirements
 ------------
-pip install yfinance scikit-learn pandas numpy matplotlib
+pip install yfinance scikit-learn pandas numpy matplotlib lxml
 
 Usage
 -----
@@ -48,7 +48,6 @@ from stock_predictor import (
     TRAINING_POOL_TICKERS,
     MARKET_TICKER,
     HORIZONS,
-    FEATURE_COLUMNS,
     FEATURE_DISPLAY_NAMES,
     train_multi_horizon_model,
 )
@@ -473,8 +472,24 @@ class StockPredictorApp(tk.Tk):
             self._render_placeholder(ticker, self._skipped_reasons().get(ticker))
 
     def _on_horizon_change(self):
+        self._update_pooled_summary()
         self._refresh_watchlist_display()
         self._on_watchlist_select()
+
+    def _update_pooled_summary(self):
+        current = self._horizon_data()
+        if not current or "error" in current:
+            self.pooled_summary_var.set("")
+            return
+        params = current.get("best_params") or {}
+        params_txt = (f"depth={params.get('max_depth')}, lr={params.get('learning_rate')}"
+                      if params else "default settings")
+        self.pooled_summary_var.set(
+            f"Shared model trained on {len(current['per_ticker'])} ticker(s) for “{self.horizon_var.get()}” — "
+            f"pooled test accuracy {current['overall_accuracy']:.1%} "
+            f"(baseline {current['overall_baseline_accuracy']:.1%}) · "
+            f"{len(current['active_features'])} active feature(s) · tuned via walk-forward CV ({params_txt})"
+        )
 
     def _on_chart_view_change(self):
         self._on_watchlist_select()
@@ -495,9 +510,10 @@ class StockPredictorApp(tk.Tk):
         self.busy = True
         self.analyze_btn.state(["disabled"])
         self.status_var.set(
-            f"Fetching history for {len(all_tickers)} ticker(s) ({len(self.tickers)} watchlist + "
-            f"{len(all_tickers) - len(self.tickers)} training pool) plus {MARKET_TICKER}, then training "
-            f"{len(HORIZONS)} horizon models... this can take a couple of minutes."
+            f"Fetching price history, sector context, and earnings dates for {len(all_tickers)} ticker(s) "
+            f"({len(self.tickers)} watchlist + {len(all_tickers) - len(self.tickers)} training pool) plus "
+            f"{MARKET_TICKER}, then running a walk-forward hyperparameter search across {len(HORIZONS)} "
+            f"horizon models... this can take several minutes."
         )
         self.pred_heading_var.set("Training shared models...")
         self.pred_direction_var.set("⏳ Working on it...")
@@ -527,13 +543,7 @@ class StockPredictorApp(tk.Tk):
                 self.confidence_bar.configure(mode="determinate")
                 if status == "ok":
                     self.results_by_horizon = payload
-                    current = self._horizon_data()
-                    if current and "error" not in current:
-                        self.pooled_summary_var.set(
-                            f"Shared model trained on {len(current['per_ticker'])} ticker(s) for "
-                            f"“{self.horizon_var.get()}” — pooled test accuracy "
-                            f"{current['overall_accuracy']:.1%} (baseline {current['overall_baseline_accuracy']:.1%})"
-                        )
+                    self._update_pooled_summary()
                     skipped_reasons = self._skipped_reasons()
                     if skipped_reasons:
                         self.status_var.set(f"Done. Skipped (insufficient data): {', '.join(skipped_reasons)}")
@@ -684,9 +694,12 @@ class StockPredictorApp(tk.Tk):
 
     def _draw_importance_chart(self, horizon_data):
         importances = horizon_data["feature_importances"] if horizon_data and "error" not in horizon_data else {}
-        order = sorted(range(len(FEATURE_COLUMNS)), key=lambda i: importances.get(FEATURE_COLUMNS[i], 0))
-        names = [FEATURE_DISPLAY_NAMES[FEATURE_COLUMNS[i]] for i in order]
-        raw_values = [importances.get(FEATURE_COLUMNS[i], 0) for i in order]
+        # Only features that survived this horizon's pruning step are trained on
+        # at all — everything else was screened out before the final fit.
+        active_features = horizon_data["active_features"] if horizon_data and "error" not in horizon_data else []
+        order = sorted(range(len(active_features)), key=lambda i: importances.get(active_features[i], 0))
+        names = [FEATURE_DISPLAY_NAMES[active_features[i]] for i in order]
+        raw_values = [importances.get(active_features[i], 0) for i in order]
         # Raw permutation importance is a fraction of accuracy (e.g. 0.006) — shown
         # instead as "accuracy points lost if this signal were scrambled" (0.6),
         # which reads naturally on an axis instead of a wall of tiny decimals.
