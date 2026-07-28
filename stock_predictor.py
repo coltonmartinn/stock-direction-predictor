@@ -164,14 +164,41 @@ def fetch_earnings_dates(ticker: str) -> pd.DatetimeIndex:
     """Best-effort fetch of known earnings report dates (past + upcoming) for
     a ticker. Returns an empty index on any failure — the earnings-proximity
     feature just falls back to a neutral "unknown" value in that case."""
+    import logging
+    yf_logger = logging.getLogger("yfinance")
+    previous_level = yf_logger.level
     try:
         import yfinance as yf
+        # ETFs/funds legitimately have no earnings — yfinance logs that as an
+        # "error" by default, which is expected/harmless here, not worth
+        # surfacing. Only silenced for this one call, so real problems
+        # elsewhere (price fetch, etc.) still get logged normally.
+        yf_logger.setLevel(logging.CRITICAL)
         df = yf.Ticker(ticker).get_earnings_dates(limit=60)
         if df is None or df.empty:
             return pd.DatetimeIndex([])
         return pd.DatetimeIndex(df.index).tz_localize(None)
     except Exception:
         return pd.DatetimeIndex([])
+    finally:
+        yf_logger.setLevel(previous_level)
+
+
+def is_fund_ticker(ticker: str) -> bool:
+    """True if `ticker` looks like an ETF / index / mutual fund rather than an
+    individual company. This model leans on per-company signals — earnings
+    reports, a single GICS sector — that don't cleanly apply to a basket of
+    many stocks, so funds are excluded from the watchlist rather than silently
+    given meaningless values for those features."""
+    known_fund_tickers = set(TICKER_SECTOR_ETF.values()) | {MARKET_TICKER}
+    if ticker in known_fund_tickers:
+        return True
+    try:
+        import yfinance as yf
+        quote_type = yf.Ticker(ticker).info.get("quoteType", "")
+        return quote_type in ("ETF", "MUTUALFUND", "INDEX")
+    except Exception:
+        return False  # fail-open: if we can't tell, don't block the add
 
 
 # --------------------------------------------------------------------------

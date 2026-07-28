@@ -50,6 +50,7 @@ from stock_predictor import (
     HORIZONS,
     FEATURE_DISPLAY_NAMES,
     train_multi_horizon_model,
+    is_fund_ticker,
 )
 
 # --------------------------------------------------------------------------
@@ -239,8 +240,9 @@ class StockPredictorApp(tk.Tk):
         entry = ttk.Entry(add_frame, textvariable=self.new_ticker_var)
         entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
         entry.bind("<Return>", lambda e: self._add_ticker())
-        ttk.Button(add_frame, text="Add", width=6, style="Accent.TButton", cursor="hand2",
-                   command=self._add_ticker).pack(side=tk.LEFT, padx=(6, 0))
+        self.add_ticker_btn = ttk.Button(add_frame, text="Add", width=6, style="Accent.TButton", cursor="hand2",
+                                          command=self._add_ticker)
+        self.add_ticker_btn.pack(side=tk.LEFT, padx=(6, 0))
 
         list_frame = tk.Frame(left_pad, bg=COLORS["card_bg"])
         list_frame.pack(fill=tk.BOTH, expand=True)
@@ -403,14 +405,42 @@ class StockPredictorApp(tk.Tk):
         if raw in self.tickers:
             messagebox.showinfo("Already added", f"{raw} is already in the watchlist.")
             return
-        self.tickers.append(raw)
-        save_watchlist(self.tickers)
+
+        self.add_ticker_btn.state(["disabled"])
+        self.status_var.set(f"Checking {raw}...")
         self.new_ticker_var.set("")
+        thread = threading.Thread(target=self._run_ticker_check, args=(raw,), daemon=True)
+        thread.start()
+
+    def _run_ticker_check(self, ticker):
+        """Runs on a background thread — must not touch Tk widgets directly."""
+        try:
+            is_fund = is_fund_ticker(ticker)
+        except Exception:
+            is_fund = False  # fail-open: an unexpected error here shouldn't block adding a real stock
+        self.work_queue.put(("ticker_check", (ticker, is_fund)))
+
+    def _finish_add_ticker(self, ticker, is_fund):
+        self.add_ticker_btn.state(["!disabled"])
+        if is_fund:
+            self.status_var.set(f"{ticker} not added — ETFs and funds aren't supported.")
+            messagebox.showerror(
+                "ETFs / funds aren't supported",
+                f"{ticker} looks like an ETF, index, or mutual fund, not an individual company.\n\n"
+                "This model relies on signals that only make sense for a single company — its own "
+                "earnings reports and a single sector — which don't cleanly apply to a basket of many "
+                "stocks. Add the individual stocks you're interested in instead."
+            )
+            return
+
+        self.tickers.append(ticker)
+        save_watchlist(self.tickers)
         self._refresh_watchlist_display()
         self.watchlist.selection_clear(0, tk.END)
         self.watchlist.selection_set(tk.END)
         self.watchlist.see(tk.END)
         self._on_watchlist_select()
+        self.status_var.set(f"Added {ticker}.")
 
     def _remove_ticker(self):
         sel = self.watchlist.curselection()
@@ -537,6 +567,12 @@ class StockPredictorApp(tk.Tk):
         try:
             while True:
                 status, payload = self.work_queue.get_nowait()
+
+                if status == "ticker_check":
+                    ticker, is_fund = payload
+                    self._finish_add_ticker(ticker, is_fund)
+                    continue
+
                 self.busy = False
                 self.analyze_btn.state(["!disabled"])
                 self.confidence_bar.stop()
